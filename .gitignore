@@ -1,0 +1,4 @@
+/target/
+*.profraw
+*.profdata
+__pycache__/
