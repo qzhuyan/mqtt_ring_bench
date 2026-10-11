@@ -8,6 +8,8 @@ mod config;
 #[cfg(target_os = "linux")]
 mod connection;
 #[cfg(target_os = "linux")]
+mod scheduler;
+#[cfg(target_os = "linux")]
 mod stats;
 #[cfg(target_os = "linux")]
 mod worker_common;

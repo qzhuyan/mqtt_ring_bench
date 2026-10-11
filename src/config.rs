@@ -239,6 +239,10 @@ pub fn parse_args() -> BenchConfig {
         eprintln!("Error: --clients must be > 0");
         std::process::exit(1);
     }
+    if config.connect_rate == 0 {
+        eprintln!("Error: --connect-rate must be > 0");
+        std::process::exit(1);
+    }
     if config.qos > 2 {
         eprintln!("Error: --qos must be 0, 1, or 2");
         std::process::exit(1);

@@ -165,6 +165,9 @@ impl Connection {
                 return false;
             }
         }
+        // Consume a due interval before trying to publish. If backpressure
+        // rejects this attempt, I/O or a protocol timer will make it ready again.
+        self.next_publish_at = None;
 
         let payload = vec![0x42u8; config.payload_size];
         let cmd = PublishCommand::builder()
@@ -503,6 +506,9 @@ pub struct QuicConnection {
     pub send_pending: bool,
     pub client_index: usize,
     pub drain_deadline: Option<Instant>,
+    /// FlowSDK 0.7 does not expose quinn's next transport timeout. Preserve
+    /// its 10 ms driving cadence without ticking on unrelated clients' I/O.
+    pub next_transport_tick: Instant,
     pub server_addr: SocketAddr,
     topic: String,
     pub messages_received: u64,
@@ -550,6 +556,7 @@ impl QuicConnection {
             send_pending: false,
             client_index,
             drain_deadline: None,
+            next_transport_tick: Instant::now(),
             server_addr,
             topic: config.topic_for_client(client_index),
             messages_received: 0,
@@ -585,13 +592,12 @@ impl QuicConnection {
     pub fn handle_datagram(&mut self, data: &[u8], now: Instant) -> Vec<MqttEvent> {
         self.engine
             .handle_datagram(data.to_vec(), self.server_addr, now);
-        let events = self.engine.handle_tick(now);
-        self.drain_outgoing_datagrams();
-        events
+        self.handle_tick(now)
     }
 
     /// Drive the QUIC + MQTT state machines forward.
     pub fn handle_tick(&mut self, now: Instant) -> Vec<MqttEvent> {
+        self.next_transport_tick = now + Duration::from_millis(10);
         let events = self.engine.handle_tick(now);
         self.drain_outgoing_datagrams();
         events
@@ -609,6 +615,7 @@ impl QuicConnection {
                 return false;
             }
         }
+        self.next_publish_at = None;
 
         let payload = vec![0x42u8; config.payload_size];
         let cmd = PublishCommand::builder()

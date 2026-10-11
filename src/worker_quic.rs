@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use io_uring::opcode;
-use io_uring::types::{Fd, SubmitArgs, Timespec};
-use io_uring::IoUring;
+use io_uring::types::Fd;
 use slab::Slab;
 use socket2::{Domain, SockAddr, Socket, Type};
 use std::os::fd::IntoRawFd;
@@ -13,10 +12,11 @@ use std::time::Instant;
 
 use crate::config::BenchConfig;
 use crate::connection::{EventOutcome, QuicConnState, QuicConnection};
+use crate::scheduler::{ConnectPacer, Scheduler};
 use crate::stats::{BenchStats, ErrorKind};
 use crate::worker_common::{
-    cancel_pending_operations, decode_user_data, encode_user_data, pending_user_data, WorkerResult,
-    OP_RECV, OP_SEND,
+    decode_user_data, encode_user_data, pending_user_data, WorkerResult, WorkerRing, OP_RECV,
+    OP_SEND,
 };
 
 pub fn run_quic_worker(
@@ -34,11 +34,12 @@ pub fn run_quic_worker(
     }
 
     let ring_size = 4096u32.min((num_conns as u32 * 3).next_power_of_two().max(64));
-    let mut ring: IoUring = IoUring::builder()
-        .build(ring_size)
+    let mut ring = WorkerRing::new(ring_size)
         .unwrap_or_else(|e| panic!("worker {}: failed to create io_uring: {}", worker_id, e));
 
     let mut conns: Slab<Box<QuicConnection>> = Slab::with_capacity(num_conns);
+    let mut scheduler = Scheduler::new(num_conns);
+    let mut cqes = Vec::new();
 
     let server_name = config
         .server_name
@@ -46,9 +47,8 @@ pub fn run_quic_worker(
         .unwrap_or(&config.host)
         .to_string();
 
-    let budget_per_sec = config.connect_rate / config.workers.max(1);
-    let mut connect_budget: f64 = 0.0;
-    let mut last_budget_tick = Instant::now();
+    let workers = config.workers.min(config.clients).max(1);
+    let mut pacer = ConnectPacer::new(config.connect_rate, workers, Instant::now());
     let mut pending_create: Vec<usize> = conn_range.collect();
     pending_create.reverse();
 
@@ -62,18 +62,9 @@ pub fn run_quic_worker(
 
         let now = Instant::now();
 
-        // Replenish connect budget
-        let elapsed_secs = now.duration_since(last_budget_tick).as_secs_f64();
-        if elapsed_secs >= 0.01 {
-            connect_budget += budget_per_sec as f64 * elapsed_secs;
-            if connect_budget > pending_create.len() as f64 {
-                connect_budget = pending_create.len() as f64;
-            }
-            last_budget_tick = now;
-        }
-
-        // Create UDP sockets, initiate QUIC handshake
-        while connect_budget >= 1.0 {
+        // Keep connection ramp-up in the same deadline-driven loop.
+        let count = pacer.take(now, pending_create.len());
+        for _ in 0..count {
             if let Some(client_idx) = pending_create.pop() {
                 let bind_ip = if config.ifaddrs.is_empty() {
                     None
@@ -98,7 +89,6 @@ pub fn run_quic_worker(
                             stats.record_error(ErrorKind::Connect);
                             stats.clients_done.fetch_add(1, Ordering::Relaxed);
                             done_count += 1;
-                            connect_budget -= 1.0;
                             continue;
                         }
 
@@ -111,6 +101,7 @@ pub fn run_quic_worker(
                                         // Submit initial handshake datagrams + recv
                                         submit_front_send(&mut ring, key, &mut conns[key]);
                                         submit_recv(&mut ring, key, &mut conns[key]);
+                                        scheduler.mark_ready(key);
                                     }
                                     Err(e) => {
                                         eprintln!(
@@ -139,14 +130,12 @@ pub fn run_quic_worker(
                                 done_count += 1;
                             }
                         }
-                        connect_budget -= 1.0;
                     }
                     Err(e) => {
                         eprintln!("worker {}: UDP socket creation failed: {}", worker_id, e);
                         stats.record_error(ErrorKind::Socket);
                         stats.clients_done.fetch_add(1, Ordering::Relaxed);
                         done_count += 1;
-                        connect_budget -= 1.0;
                     }
                 }
             } else {
@@ -154,25 +143,18 @@ pub fn run_quic_worker(
             }
         }
 
-        // Wait up to 10ms for completions (QUIC needs frequent ticking)
-        let ts = Timespec::new().nsec(10_000_000); // 10ms
-        let args = SubmitArgs::new().timespec(&ts);
-        let wait_count = if conns.is_empty() { 0 } else { 1 };
-        match ring.submitter().submit_with_args(wait_count, &args) {
-            Ok(_) => {}
-            Err(ref e) if e.raw_os_error() == Some(libc::EINTR) => continue,
-            Err(ref e) if e.raw_os_error() == Some(libc::EBUSY) => continue,
-            Err(ref e) if e.raw_os_error() == Some(libc::ETIME) => {} // timeout, continue
-            Err(e) => {
-                eprintln!("worker {}: io_uring submit error: {}", worker_id, e);
-                break;
-            }
+        if done_count >= num_conns && pending_create.is_empty() {
+            break;
+        }
+        let ramp = (!pending_create.is_empty()).then(|| pacer.next_at());
+        let wait = scheduler.wait_duration(Instant::now(), ramp);
+        if let Err(e) = ring.wait(wait) {
+            eprintln!("worker {}: io_uring submit error: {}", worker_id, e);
+            break;
         }
 
-        // Process completions
-        let now = Instant::now();
-        let cqes: Vec<_> = ring.completion().collect();
-        for cqe in cqes {
+        cqes.extend(ring.completion());
+        for cqe in cqes.drain(..) {
             let (conn_key, op) = decode_user_data(cqe.user_data());
             let result = cqe.result();
 
@@ -202,69 +184,19 @@ pub fn run_quic_worker(
                         &mut done_count,
                     );
                 }
-                _ => {}
+                _ => continue,
             }
+            scheduler.mark_ready(conn_key);
         }
 
-        // Drive QUIC + MQTT state machines. The io_uring wait timeout (10ms)
-        // provides the cadence; quinn-proto's loss detection and pacing need
-        // ticks at roughly that rate regardless of CQE arrivals.
-        {
-            let keys: Vec<usize> = conns
-                .iter()
-                .filter(|(_, c)| c.state != QuicConnState::Done && c.state != QuicConnState::Failed)
-                .map(|(k, _)| k)
-                .collect();
-            for key in keys {
-                let conn = &mut conns[key];
-
-                // Drive QUIC state machine
-                let events = conn.handle_tick(now);
-                if !events.is_empty() {
-                    let outcome = conn.process_events(events, &config);
-                    if outcome.connected {
-                        stats.clients_connected.fetch_add(1, Ordering::Relaxed);
-                    }
-                    if outcome.acked > 0 {
-                        stats
-                            .messages_acked
-                            .fetch_add(outcome.acked, Ordering::Relaxed);
-                    }
-                    record_mqtt_outcome(stats.as_ref(), &outcome);
-                    if outcome.failed {
-                        finish_mqtt_failure(stats.as_ref(), &mut done_count);
-                    }
-                }
-
-                // Try publish
-                if conn.state == QuicConnState::Publishing {
-                    if conn.try_publish(&config, now) {
-                        stats.messages_sent.fetch_add(1, Ordering::Relaxed);
-                    }
-                    conn.check_publish_complete();
-                }
-
-                conn.check_receive_complete(now);
-
-                // Check drain
-                if conn.state == QuicConnState::Draining {
-                    conn.check_drain_complete(now);
-                }
-
-                // Check if disconnecting is done (no more sends pending)
-                if conn.state == QuicConnState::Disconnecting
-                    && !conn.has_pending_send()
-                    && !conn.send_pending
-                {
-                    conn.state = QuicConnState::Done;
-                    stats.clients_done.fetch_add(1, Ordering::Relaxed);
-                    done_count += 1;
-                }
-
-                // Submit any new outgoing datagrams
-                if conn.has_pending_send() && !conn.send_pending {
-                    submit_front_send(&mut ring, key, conn);
-                }
+        scheduler.wake_due(Instant::now());
+        for _ in 0..scheduler.ready_len() {
+            let key = scheduler.pop_ready().unwrap();
+            let conn = &mut conns[key];
+            let again = drive_connection(conn, key, &mut ring, &config, &stats, &mut done_count);
+            scheduler.schedule(key, next_deadline(conn));
+            if again {
+                scheduler.mark_ready(key);
             }
         }
 
@@ -279,7 +211,7 @@ pub fn run_quic_worker(
         .collect();
     // Cancel ring operations before shutting down sockets. Bulk shutdown first can
     // wake thousands of async-poll receives into task_work on older kernels.
-    if let Err(error) = cancel_pending_operations(&mut ring, pending) {
+    if let Err(error) = ring.shutdown(pending) {
         eprintln!("worker {}: io_uring shutdown failed: {}", worker_id, error);
         unsafe {
             libc::_exit(if stats.stopped.load(Ordering::Relaxed) {
@@ -355,12 +287,15 @@ fn handle_send_complete(
     conns: &mut Slab<Box<QuicConnection>>,
     key: usize,
     result: i32,
-    ring: &mut IoUring,
+    ring: &mut WorkerRing,
     stats: &BenchStats,
     done_count: &mut usize,
 ) {
     let conn = &mut conns[key];
     conn.send_pending = false;
+    if matches!(conn.state, QuicConnState::Done | QuicConnState::Failed) {
+        return;
+    }
 
     if result < 0 {
         let err_code = -result;
@@ -386,13 +321,16 @@ fn handle_recv_complete(
     conns: &mut Slab<Box<QuicConnection>>,
     key: usize,
     result: i32,
-    ring: &mut IoUring,
+    ring: &mut WorkerRing,
     config: &BenchConfig,
     stats: &BenchStats,
     done_count: &mut usize,
 ) {
     let conn = &mut conns[key];
     conn.recv_pending = false;
+    if matches!(conn.state, QuicConnState::Done | QuicConnState::Failed) {
+        return;
+    }
 
     if result <= 0 {
         if result < 0 {
@@ -435,29 +373,95 @@ fn handle_recv_complete(
         }
     }
 
-    // Try to publish after receiving (may have transitioned to Publishing)
-    if conn.state == QuicConnState::Publishing {
-        if conn.try_publish(config, now) {
-            stats.messages_sent.fetch_add(1, Ordering::Relaxed);
-        }
-        conn.check_publish_complete();
-    }
-
     conn.check_receive_complete(now);
 
-    if conn.state == QuicConnState::Draining {
-        conn.check_drain_complete(now);
+    // Continue receiving (unless done/failed)
+    if !matches!(
+        conn.state,
+        QuicConnState::Done | QuicConnState::Failed | QuicConnState::Disconnecting
+    ) {
+        submit_recv(ring, key, conn);
     }
+}
 
-    // Submit outgoing datagrams
+fn drive_connection(
+    conn: &mut QuicConnection,
+    key: usize,
+    ring: &mut WorkerRing,
+    config: &BenchConfig,
+    stats: &BenchStats,
+    done_count: &mut usize,
+) -> bool {
+    if matches!(conn.state, QuicConnState::Done | QuicConnState::Failed) {
+        return false;
+    }
+    let now = Instant::now();
+    let events = conn.handle_tick(now);
+    if !events.is_empty() {
+        let outcome = conn.process_events(events, config);
+        if outcome.connected {
+            stats.clients_connected.fetch_add(1, Ordering::Relaxed);
+        }
+        if outcome.acked > 0 {
+            stats
+                .messages_acked
+                .fetch_add(outcome.acked, Ordering::Relaxed);
+        }
+        record_mqtt_outcome(stats, &outcome);
+        if outcome.failed {
+            finish_mqtt_failure(stats, done_count);
+            return false;
+        }
+    }
+    let published = conn.state == QuicConnState::Publishing
+        && !conn.send_pending
+        && !conn.has_pending_send()
+        && conn.try_publish(config, now);
+    if published {
+        stats.messages_sent.fetch_add(1, Ordering::Relaxed);
+    }
+    conn.check_publish_complete();
+    conn.check_receive_complete(now);
+    conn.check_drain_complete(now);
     if conn.has_pending_send() && !conn.send_pending {
         submit_front_send(ring, key, conn);
     }
-
-    // Continue receiving (unless done/failed)
-    if conn.state != QuicConnState::Done && conn.state != QuicConnState::Failed {
-        submit_recv(ring, key, conn);
+    if conn.state == QuicConnState::Disconnecting && !conn.has_pending_send() && !conn.send_pending
+    {
+        conn.state = QuicConnState::Done;
+        stats.clients_done.fetch_add(1, Ordering::Relaxed);
+        *done_count += 1;
     }
+    published
+        && conn.state == QuicConnState::Publishing
+        && !conn.send_pending
+        && !conn.has_pending_send()
+        && config.interval_ms == 0
+}
+
+fn next_deadline(conn: &QuicConnection) -> Option<Instant> {
+    if matches!(conn.state, QuicConnState::Done | QuicConnState::Failed) {
+        return None;
+    }
+    let publish = if conn.state == QuicConnState::Publishing
+        && !conn.send_pending
+        && !conn.has_pending_send()
+    {
+        conn.next_publish_at
+    } else {
+        None
+    };
+    let drain = if conn.state == QuicConnState::Draining {
+        conn.drain_deadline
+    } else {
+        None
+    };
+    Some(conn.next_transport_tick)
+        .into_iter()
+        .chain(conn.engine.engine().next_tick_at())
+        .chain(publish)
+        .chain(drain)
+        .min()
 }
 
 fn mark_failed(
@@ -496,7 +500,7 @@ fn finish_mqtt_failure(stats: &BenchStats, done_count: &mut usize) {
     *done_count += 1;
 }
 
-fn submit_front_send(ring: &mut IoUring, key: usize, conn: &mut QuicConnection) {
+fn submit_front_send(ring: &mut WorkerRing, key: usize, conn: &mut QuicConnection) {
     if conn.send_pending {
         return;
     }
@@ -513,14 +517,11 @@ fn submit_front_send(ring: &mut IoUring, key: usize, conn: &mut QuicConnection) 
 
     conn.send_pending = true;
     unsafe {
-        if ring.submission().push(&send_e).is_err() {
-            let _ = ring.submitter().submit();
-            let _ = ring.submission().push(&send_e);
-        }
+        ring.push(send_e);
     }
 }
 
-fn submit_recv(ring: &mut IoUring, key: usize, conn: &mut QuicConnection) {
+fn submit_recv(ring: &mut WorkerRing, key: usize, conn: &mut QuicConnection) {
     if conn.recv_pending {
         return;
     }
@@ -533,9 +534,34 @@ fn submit_recv(ring: &mut IoUring, key: usize, conn: &mut QuicConnection) {
 
     conn.recv_pending = true;
     unsafe {
-        if ring.submission().push(&recv_e).is_err() {
-            let _ = ring.submitter().submit();
-            let _ = ring.submission().push(&recv_e);
-        }
+        ring.push(recv_e);
+    }
+}
+
+#[cfg(test)]
+mod scheduling_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn quic_transport_ticks_publish_intervals_and_drain_are_scheduled() {
+        let config = BenchConfig {
+            keep_alive: 0,
+            ..BenchConfig::default()
+        };
+        let mut conn = QuicConnection::new(-1, 0, &config, config.addr).unwrap();
+        let now = Instant::now();
+        conn.handle_tick(now);
+        assert_eq!(next_deadline(&conn), Some(now + Duration::from_millis(10)));
+        conn.state = QuicConnState::Publishing;
+        conn.next_publish_at = Some(now + Duration::from_millis(2));
+        assert_eq!(next_deadline(&conn), conn.next_publish_at);
+        conn.send_pending = true;
+        assert_eq!(next_deadline(&conn), Some(conn.next_transport_tick));
+        conn.state = QuicConnState::Draining;
+        conn.drain_deadline = Some(now);
+        assert_eq!(next_deadline(&conn), Some(now));
+        conn.state = QuicConnState::Failed;
+        assert_eq!(next_deadline(&conn), None);
     }
 }

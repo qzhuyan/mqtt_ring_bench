@@ -1,26 +1,25 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use io_uring::opcode;
-use io_uring::types::{Fd, SubmitArgs, Timespec};
-use io_uring::IoUring;
+use io_uring::types::Fd;
 use slab::Slab;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
-use std::os::fd::IntoRawFd;
-use std::os::fd::RawFd;
+use std::os::fd::{IntoRawFd, RawFd};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::config::BenchConfig;
 use crate::connection::{ConnState, Connection, EventOutcome};
+use crate::scheduler::{ConnectPacer, Scheduler};
 use crate::stats::{BenchStats, ErrorKind};
 use crate::worker_common::{
-    cancel_pending_operations, decode_user_data, encode_user_data, pending_user_data, WorkerResult,
-    OP_CONNECT, OP_RECV, OP_SEND,
+    decode_user_data, encode_user_data, pending_user_data, WorkerResult, WorkerRing, OP_CONNECT,
+    OP_RECV, OP_SEND,
 };
 
-/// Each Connection is Box-allocated so its buffers have stable addresses
-/// for io_uring SQEs (Slab<T> may relocate entries on grow).
+/// Box allocation keeps every connection's I/O buffers stable while its
+/// operations are queued locally or owned by the kernel.
 pub fn run_worker(
     worker_id: usize,
     conn_range: std::ops::Range<usize>,
@@ -33,228 +32,107 @@ pub fn run_worker(
             latency_samples: Vec::new(),
         };
     }
-
     let ring_size = 4096u32.min((num_conns as u32 * 3).next_power_of_two().max(64));
-    let mut ring: IoUring = IoUring::builder()
-        .build(ring_size)
+    let mut ring = WorkerRing::new(ring_size)
         .unwrap_or_else(|e| panic!("worker {}: failed to create io_uring: {}", worker_id, e));
-
     let mut conns: Slab<Box<Connection>> = Slab::with_capacity(num_conns);
+    let mut scheduler = Scheduler::new(num_conns);
+    let mut cqes = Vec::new();
 
-    // We need SockAddr to stay alive for the duration of connect SQEs.
-    // Keep one per in-flight connect. Once connected, it can be dropped.
-    let sock_addr = SockAddr::from(config.addr);
-    // Pin the SockAddr in a Box so its address is stable for io_uring.
-    let sock_addr_box = Box::new(sock_addr);
+    // Connect SQEs reference this address until their completion or cancellation.
+    let sock_addr_box = Box::new(SockAddr::from(config.addr));
     let sa_ptr = sock_addr_box.as_ref().as_ptr();
     let sa_len = sock_addr_box.as_ref().len();
+    let workers = config.workers.min(config.clients).max(1);
+    let mut pacer = ConnectPacer::new(config.connect_rate, workers, Instant::now());
+    let mut pending_create = conn_range;
+    let mut done_count = 0usize;
+    let mut ifaddr_idx = 0usize;
 
-    let budget_per_sec = config.connect_rate / config.workers.max(1);
-    let mut connect_budget: f64 = 0.0;
-    let mut last_budget_tick = Instant::now();
-    let mut pending_create: Vec<usize> = conn_range.collect();
-    pending_create.reverse();
-
-    let mut done_count: usize = 0;
-    let mut ifaddr_idx: usize = 0;
-    // Upper bound on idle wait — keeps Ctrl+C / shutdown responsive even when
-    // no protocol timer is scheduled.
-    let max_idle_wait = Duration::from_secs(1);
-
-    loop {
-        if stats.stopped.load(Ordering::Relaxed) {
+    while !stats.stopped.load(Ordering::Relaxed) {
+        let count = pacer.take(Instant::now(), pending_create.len());
+        for client_idx in pending_create.by_ref().take(count) {
+            let bind_ip = if config.ifaddrs.is_empty() {
+                None
+            } else {
+                let ip = config.ifaddrs[ifaddr_idx % config.ifaddrs.len()];
+                ifaddr_idx += 1;
+                Some(ip)
+            };
+            match create_socket(&config, bind_ip) {
+                Ok(fd) => {
+                    let key = conns.insert(Box::new(Connection::new(fd, client_idx, &config)));
+                    let entry = opcode::Connect::new(Fd(fd), sa_ptr, sa_len)
+                        .build()
+                        .user_data(encode_user_data(key, OP_CONNECT));
+                    // SAFETY: the socket address and connections live until shutdown drains I/O.
+                    unsafe {
+                        ring.push(entry);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("worker {}: socket creation failed: {}", worker_id, e);
+                    stats.record_error(ErrorKind::Socket);
+                    stats.clients_done.fetch_add(1, Ordering::Relaxed);
+                    done_count += 1;
+                }
+            }
+        }
+        if done_count >= num_conns && pending_create.is_empty() {
             break;
         }
 
-        let now = Instant::now();
-
-        // Replenish connect budget using fractional accumulation
-        let elapsed_secs = now.duration_since(last_budget_tick).as_secs_f64();
-        if elapsed_secs >= 0.01 {
-            connect_budget += budget_per_sec as f64 * elapsed_secs;
-            if connect_budget > pending_create.len() as f64 {
-                connect_budget = pending_create.len() as f64;
-            }
-            last_budget_tick = now;
+        let ramp = (!pending_create.is_empty()).then(|| pacer.next_at());
+        let wait = scheduler.wait_duration(Instant::now(), ramp);
+        if let Err(e) = ring.wait(wait) {
+            eprintln!("worker {}: io_uring submit error: {}", worker_id, e);
+            break;
         }
 
-        // Create sockets and submit connect SQEs
-        while connect_budget >= 1.0 {
-            if let Some(client_idx) = pending_create.pop() {
-                let bind_ip = if config.ifaddrs.is_empty() {
-                    None
-                } else {
-                    let ip = config.ifaddrs[ifaddr_idx % config.ifaddrs.len()];
-                    ifaddr_idx += 1;
-                    Some(ip)
-                };
-                match create_socket(&config, bind_ip) {
-                    Ok(fd) => {
-                        let conn = Box::new(Connection::new(fd, client_idx, &config));
-                        let key = conns.insert(conn);
-
-                        let connect_e = opcode::Connect::new(Fd(fd), sa_ptr as *const _, sa_len)
-                            .build()
-                            .user_data(encode_user_data(key, OP_CONNECT));
-
-                        unsafe {
-                            if ring.submission().push(&connect_e).is_err() {
-                                // SQ full, submit and retry
-                                let _ = ring.submitter().submit();
-                                let _ = ring.submission().push(&connect_e);
-                            }
-                        }
-                        connect_budget -= 1.0;
-                    }
-                    Err(e) => {
-                        eprintln!("worker {}: socket creation failed: {}", worker_id, e);
-                        stats.record_error(ErrorKind::Socket);
-                        stats.clients_done.fetch_add(1, Ordering::Relaxed);
-                        done_count += 1;
-                        connect_budget -= 1.0;
-                    }
-                }
-            } else {
-                break;
-            }
-        }
-
-        // Wait for the soonest of: next protocol deadline, a CQE arrival, or
-        // `max_idle_wait` (keeps shutdown responsive when nothing is scheduled).
-        let min_deadline = conns
-            .iter()
-            .filter(|(_, c)| {
-                c.state != ConnState::Done
-                    && c.state != ConnState::Failed
-                    && c.state != ConnState::TcpConnecting
-            })
-            .filter_map(|(_, c)| c.next_tick_at())
-            .min();
-        let wait_dur = match min_deadline {
-            Some(d) => d.saturating_duration_since(now).min(max_idle_wait),
-            None => max_idle_wait,
-        };
-        let wait_count = if conns.is_empty() || wait_dur.is_zero() {
-            0
-        } else {
-            1
-        };
-        let ts = Timespec::new()
-            .sec(wait_dur.as_secs())
-            .nsec(wait_dur.subsec_nanos());
-        let args = SubmitArgs::new().timespec(&ts);
-        match ring.submitter().submit_with_args(wait_count, &args) {
-            Ok(_) => {}
-            Err(ref e) if e.raw_os_error() == Some(libc::EINTR) => continue,
-            Err(ref e) if e.raw_os_error() == Some(libc::EBUSY) => continue,
-            Err(ref e) if e.raw_os_error() == Some(libc::ETIME) => {} // deadline hit, fall through to tick
-            Err(e) => {
-                eprintln!("worker {}: io_uring submit error: {}", worker_id, e);
-                break;
-            }
-        }
-
-        // Process completions
-        let cqes: Vec<_> = ring.completion().collect();
-        for cqe in cqes {
-            let (conn_key, op) = decode_user_data(cqe.user_data());
-            let result = cqe.result();
-
-            if !conns.contains(conn_key) {
+        // Reuse the completion buffer and visit only connections with I/O or
+        // expired deadlines. EBUSY also reaches this draining path.
+        cqes.extend(ring.completion());
+        for cqe in cqes.drain(..) {
+            let (key, op) = decode_user_data(cqe.user_data());
+            if !conns.contains(key) {
                 continue;
             }
-
+            let conn = &mut conns[key];
             match op {
-                OP_CONNECT => {
-                    handle_connect_complete(&mut conns, conn_key, result, &mut ring, &stats);
-                }
-                OP_SEND => {
-                    handle_send_complete(
-                        &mut conns,
-                        conn_key,
-                        result,
-                        &mut ring,
-                        &config,
-                        &stats,
-                        &mut done_count,
-                    );
-                }
-                OP_RECV => {
-                    handle_recv_complete(
-                        &mut conns,
-                        conn_key,
-                        result,
-                        &mut ring,
-                        &config,
-                        &stats,
-                        &mut done_count,
-                    );
-                }
-                _ => {}
+                OP_CONNECT => handle_connect_complete(
+                    conn,
+                    key,
+                    cqe.result(),
+                    &mut ring,
+                    &stats,
+                    &mut done_count,
+                ),
+                OP_SEND => handle_send_complete(conn, cqe.result(), &stats, &mut done_count),
+                OP_RECV => handle_recv_complete(
+                    conn,
+                    key,
+                    cqe.result(),
+                    &mut ring,
+                    &config,
+                    &stats,
+                    &mut done_count,
+                ),
+                _ => continue,
             }
+            scheduler.mark_ready(key);
         }
-
-        // Try to publish on ready connections
-        let keys: Vec<usize> = conns
-            .iter()
-            .filter(|(_, c)| c.state == ConnState::Publishing && !c.send_pending)
-            .map(|(k, _)| k)
-            .collect();
-        for key in keys {
+        scheduler.wake_due(Instant::now());
+        // A publisher may requeue itself. Limit this pass so I/O, timers and
+        // shutdown still get serviced between batches of ready connections.
+        for _ in 0..scheduler.ready_len() {
+            let key = scheduler.pop_ready().unwrap();
             let conn = &mut conns[key];
-            if conn.try_publish(&config) {
-                stats.messages_sent.fetch_add(1, Ordering::Relaxed);
-                submit_send(&mut ring, key, conn);
-            }
-            conn.check_publish_complete();
-            if conn.state == ConnState::Draining
-                && !conn.send_pending
-                && conn.check_drain_complete()
-            {
-                submit_send(&mut ring, key, conn);
+            let again = drive_connection(conn, key, &mut ring, &config, &stats, &mut done_count);
+            scheduler.schedule(key, next_deadline(conn));
+            if again {
+                scheduler.mark_ready(key);
             }
         }
-
-        // Drive protocol timers. Connection::handle_tick is a cheap no-op if
-        // the per-connection deadline hasn't been reached, so iterating every
-        // loop pass is fine — and only happens when we either got a CQE or
-        // crossed the global min_deadline computed above.
-        let tick_keys: Vec<usize> = conns
-            .iter()
-            .filter(|(_, c)| {
-                c.state != ConnState::Done
-                    && c.state != ConnState::Failed
-                    && c.state != ConnState::TcpConnecting
-            })
-            .map(|(k, _)| k)
-            .collect();
-        for key in tick_keys {
-            let conn = &mut conns[key];
-            let events = conn.handle_tick();
-            if !events.is_empty() {
-                let outcome = conn.process_events(events, &config);
-                record_mqtt_outcome(stats.as_ref(), &outcome);
-                if outcome.failed {
-                    finish_mqtt_failure(stats.as_ref(), &mut done_count);
-                }
-                if outcome.acked > 0 {
-                    stats
-                        .messages_acked
-                        .fetch_add(outcome.acked, Ordering::Relaxed);
-                }
-            }
-            conn.check_receive_complete();
-            // QoS 0 has no incoming acknowledgement to drive the receive-side
-            // drain check. Also check the drain deadline when no packets arrive.
-            if !conn.send_pending {
-                conn.check_drain_complete();
-            }
-            // PINGREQ / retransmits produce outgoing bytes without any event.
-            if conn.has_pending_send() && !conn.send_pending {
-                submit_send(&mut ring, key, conn);
-            }
-        }
-
         if done_count >= num_conns && pending_create.is_empty() {
             break;
         }
@@ -273,7 +151,7 @@ pub fn run_worker(
         .collect();
     // Cancel ring operations before shutting down sockets. Bulk shutdown first can
     // wake thousands of async-poll receives into task_work on older kernels.
-    if let Err(error) = cancel_pending_operations(&mut ring, pending) {
+    if let Err(error) = ring.shutdown(pending) {
         eprintln!("worker {}: io_uring shutdown failed: {}", worker_id, error);
         unsafe {
             libc::_exit(if stats.stopped.load(Ordering::Relaxed) {
@@ -329,177 +207,179 @@ fn create_socket(
 }
 
 fn handle_connect_complete(
-    conns: &mut Slab<Box<Connection>>,
+    conn: &mut Connection,
     key: usize,
     result: i32,
-    ring: &mut IoUring,
+    ring: &mut WorkerRing,
     stats: &BenchStats,
+    done_count: &mut usize,
 ) {
-    let conn = &mut conns[key];
     if result < 0 {
         eprintln!(
             "connection {}: TCP connect failed: {}",
             conn.client_index,
             std::io::Error::from_raw_os_error(-result)
         );
-        conn.state = ConnState::Failed;
-        stats.record_error(ErrorKind::Connect);
-        stats.clients_done.fetch_add(1, Ordering::Relaxed);
+        mark_failed(conn, stats, done_count, ErrorKind::Connect);
         return;
     }
-
     stats.clients_connected.fetch_add(1, Ordering::Relaxed);
     conn.initiate_mqtt_connect();
-    submit_send(ring, key, conn);
+    if conn.state == ConnState::Failed {
+        stats.record_error(ErrorKind::MqttConnect);
+        finish_mqtt_failure(stats, done_count);
+        return;
+    }
     submit_recv(ring, key, conn);
 }
 
 fn handle_send_complete(
-    conns: &mut Slab<Box<Connection>>,
-    key: usize,
+    conn: &mut Connection,
     result: i32,
-    ring: &mut IoUring,
-    config: &BenchConfig,
     stats: &BenchStats,
     done_count: &mut usize,
 ) {
-    let conn = &mut conns[key];
     conn.send_pending = false;
-
-    if result < 0 {
-        let err_code = -result;
-        if err_code != libc::ECONNRESET && err_code != libc::EPIPE {
+    if matches!(conn.state, ConnState::Done | ConnState::Failed) {
+        return;
+    }
+    if result <= 0 {
+        if result < 0 && !matches!(-result, libc::ECONNRESET | libc::EPIPE) {
             eprintln!(
                 "connection {}: send failed: {}",
                 conn.client_index,
-                std::io::Error::from_raw_os_error(err_code)
+                std::io::Error::from_raw_os_error(-result)
             );
         }
         mark_failed(conn, stats, done_count, ErrorKind::Send);
         return;
     }
-
     conn.advance_send(result as usize);
-
-    // Continue sending remaining bytes
-    if conn.has_pending_send() {
-        submit_send(ring, key, conn);
-        return;
-    }
-
-    match conn.state {
-        ConnState::Disconnecting => {
-            conn.state = ConnState::Done;
-            stats.clients_done.fetch_add(1, Ordering::Relaxed);
-            *done_count += 1;
-        }
-        ConnState::Publishing => {
-            if conn.try_publish(config) {
-                stats.messages_sent.fetch_add(1, Ordering::Relaxed);
-                submit_send(ring, key, conn);
-            }
-            conn.check_publish_complete();
-        }
-        _ => {}
-    }
 }
 
 fn handle_recv_complete(
-    conns: &mut Slab<Box<Connection>>,
+    conn: &mut Connection,
     key: usize,
     result: i32,
-    ring: &mut IoUring,
+    ring: &mut WorkerRing,
     config: &BenchConfig,
     stats: &BenchStats,
     done_count: &mut usize,
 ) {
-    let conn = &mut conns[key];
     conn.recv_pending = false;
-
+    if matches!(conn.state, ConnState::Done | ConnState::Failed) {
+        return;
+    }
     if result <= 0 {
-        if result < 0 {
-            let err_code = -result;
-            if err_code != libc::ECONNRESET {
-                eprintln!(
-                    "connection {}: recv error: {}",
-                    conn.client_index,
-                    std::io::Error::from_raw_os_error(err_code)
-                );
-            }
+        if result < 0 && -result != libc::ECONNRESET {
+            eprintln!(
+                "connection {}: recv error: {}",
+                conn.client_index,
+                std::io::Error::from_raw_os_error(-result)
+            );
         }
-        if conn.state != ConnState::Done && conn.state != ConnState::Disconnecting {
+        if conn.state != ConnState::Disconnecting {
             mark_failed(conn, stats, done_count, ErrorKind::Receive);
         }
         return;
     }
-
-    let nbytes = result as usize;
-    // SAFETY: recv_buf is owned by the Box<Connection> which has a stable address.
-    // The kernel wrote into recv_buf during the recv operation.
-    // We must clone/copy the data before submitting the next recv on the same buffer.
-    let data: Vec<u8> = conn.recv_buf[..nbytes].to_vec();
+    let data = conn.recv_buf[..result as usize].to_vec();
     let events = conn.handle_incoming(&data);
+    let outcome = conn.process_events(events, config);
+    record_mqtt_outcome(stats, &outcome);
+    if outcome.acked > 0 {
+        stats
+            .messages_acked
+            .fetch_add(outcome.acked, Ordering::Relaxed);
+    }
+    if outcome.failed {
+        finish_mqtt_failure(stats, done_count);
+    }
+    conn.check_receive_complete();
+    if !matches!(
+        conn.state,
+        ConnState::Done | ConnState::Failed | ConnState::Disconnecting
+    ) {
+        submit_recv(ring, key, conn);
+    }
+}
 
+fn drive_connection(
+    conn: &mut Connection,
+    key: usize,
+    ring: &mut WorkerRing,
+    config: &BenchConfig,
+    stats: &BenchStats,
+    done_count: &mut usize,
+) -> bool {
+    if matches!(
+        conn.state,
+        ConnState::Done | ConnState::Failed | ConnState::TcpConnecting
+    ) {
+        return false;
+    }
+    let events = conn.handle_tick();
     if !events.is_empty() {
         let outcome = conn.process_events(events, config);
+        record_mqtt_outcome(stats, &outcome);
         if outcome.acked > 0 {
             stats
                 .messages_acked
                 .fetch_add(outcome.acked, Ordering::Relaxed);
         }
-        record_mqtt_outcome(stats, &outcome);
         if outcome.failed {
             finish_mqtt_failure(stats, done_count);
+            return false;
         }
     }
-
+    let published =
+        conn.state == ConnState::Publishing && !conn.send_pending && conn.try_publish(config);
+    if published {
+        stats.messages_sent.fetch_add(1, Ordering::Relaxed);
+    }
+    conn.check_publish_complete();
     conn.check_receive_complete();
-
-    let drain_complete = matches!(conn.state, ConnState::Draining) && conn.check_drain_complete();
-
-    match conn.state {
-        ConnState::Publishing => {
-            if conn.has_pending_send() && !conn.send_pending {
-                submit_send(ring, key, conn);
-            } else if !conn.send_pending && conn.try_publish(config) {
-                stats.messages_sent.fetch_add(1, Ordering::Relaxed);
-                submit_send(ring, key, conn);
-            }
-            conn.check_publish_complete();
-            submit_recv(ring, key, conn);
-        }
-        ConnState::MqttConnecting | ConnState::Subscribing | ConnState::Receiving => {
-            if conn.has_pending_send() && !conn.send_pending {
-                submit_send(ring, key, conn);
-            }
-            submit_recv(ring, key, conn);
-        }
-        ConnState::Disconnecting => {
-            if conn.has_pending_send() && !conn.send_pending {
-                submit_send(ring, key, conn);
-            } else if !conn.has_pending_send() && !conn.send_pending {
-                conn.state = ConnState::Done;
-                stats.clients_done.fetch_add(1, Ordering::Relaxed);
-                *done_count += 1;
-            }
-        }
-        ConnState::Draining if drain_complete => {
-            if conn.has_pending_send() && !conn.send_pending {
-                submit_send(ring, key, conn);
-            } else if !conn.has_pending_send() {
-                conn.state = ConnState::Done;
-                stats.clients_done.fetch_add(1, Ordering::Relaxed);
-                *done_count += 1;
-            }
-        }
-        ConnState::Draining => {
-            submit_recv(ring, key, conn);
-        }
-        ConnState::Failed | ConnState::Done => {}
-        _ => {
-            submit_recv(ring, key, conn);
-        }
+    if !conn.send_pending {
+        conn.check_drain_complete();
+        submit_send(ring, key, conn);
     }
+    if conn.state == ConnState::Disconnecting && !conn.send_pending && !conn.has_pending_send() {
+        conn.state = ConnState::Done;
+        stats.clients_done.fetch_add(1, Ordering::Relaxed);
+        *done_count += 1;
+    }
+    // A successful publish can be queued inside the MQTT engine without
+    // producing bytes yet. Continue admitting work until backpressure stops it.
+    published
+        && conn.state == ConnState::Publishing
+        && !conn.send_pending
+        && !conn.has_pending_send()
+        && config.interval_ms == 0
+}
+
+fn next_deadline(conn: &Connection) -> Option<Instant> {
+    if matches!(
+        conn.state,
+        ConnState::Done | ConnState::Failed | ConnState::TcpConnecting
+    ) {
+        return None;
+    }
+    let publish =
+        if conn.state == ConnState::Publishing && !conn.send_pending && !conn.has_pending_send() {
+            conn.next_publish_at
+        } else {
+            None
+        };
+    let drain = if conn.state == ConnState::Draining && !conn.send_pending {
+        conn.drain_deadline
+    } else {
+        None
+    };
+    conn.next_tick_at()
+        .into_iter()
+        .chain(publish)
+        .chain(drain)
+        .min()
 }
 
 fn mark_failed(
@@ -538,7 +418,7 @@ fn finish_mqtt_failure(stats: &BenchStats, done_count: &mut usize) {
     *done_count += 1;
 }
 
-fn submit_send(ring: &mut IoUring, key: usize, conn: &mut Connection) {
+fn submit_send(ring: &mut WorkerRing, key: usize, conn: &mut Connection) {
     if !conn.has_pending_send() || conn.send_pending {
         return;
     }
@@ -552,14 +432,11 @@ fn submit_send(ring: &mut IoUring, key: usize, conn: &mut Connection) {
 
     conn.send_pending = true;
     unsafe {
-        if ring.submission().push(&send_e).is_err() {
-            let _ = ring.submitter().submit();
-            let _ = ring.submission().push(&send_e);
-        }
+        ring.push(send_e);
     }
 }
 
-fn submit_recv(ring: &mut IoUring, key: usize, conn: &mut Connection) {
+fn submit_recv(ring: &mut WorkerRing, key: usize, conn: &mut Connection) {
     if conn.recv_pending {
         return;
     }
@@ -572,9 +449,58 @@ fn submit_recv(ring: &mut IoUring, key: usize, conn: &mut Connection) {
 
     conn.recv_pending = true;
     unsafe {
-        if ring.submission().push(&recv_e).is_err() {
-            let _ = ring.submitter().submit();
-            let _ = ring.submission().push(&recv_e);
+        ring.push(recv_e);
+    }
+}
+
+#[cfg(test)]
+mod scheduling_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn publish_and_drain_deadlines_wake_without_mqtt_timers() {
+        let config = BenchConfig {
+            keep_alive: 0,
+            ..BenchConfig::default()
+        };
+        let mut conn = Connection::new(-1, 0, &config);
+        conn.initiate_mqtt_connect();
+        let events = conn.handle_incoming(&[0x20, 0x03, 0, 0, 0]);
+        assert!(conn.process_events(events, &config).connected);
+        while conn.has_pending_send() {
+            conn.advance_send(conn.pending_send_slice().len());
         }
+        assert_eq!(conn.next_tick_at(), None);
+        // Even a deadline that elapsed before rescheduling must wake the worker.
+        let at = Instant::now() - Duration::from_millis(1);
+        conn.next_publish_at = Some(at);
+        assert_eq!(next_deadline(&conn), Some(at));
+        conn.send_pending = true;
+        assert_eq!(next_deadline(&conn), None);
+        conn.send_pending = false;
+        conn.state = ConnState::Draining;
+        let drain = Instant::now() + Duration::from_secs(10);
+        conn.drain_deadline = Some(drain);
+        assert_eq!(next_deadline(&conn), Some(drain));
+        conn.state = ConnState::Done;
+        assert_eq!(next_deadline(&conn), None);
+    }
+
+    #[test]
+    fn rejected_publish_consumes_its_due_interval() {
+        let config = BenchConfig {
+            keep_alive: 0,
+            interval_ms: 10,
+            topic: "invalid/#".to_string(),
+            ..BenchConfig::default()
+        };
+        let mut conn = Connection::new(-1, 0, &config);
+        conn.state = ConnState::Publishing;
+        conn.next_publish_at = Some(Instant::now() - Duration::from_secs(1));
+        // A wildcard topic rejects publishing. A rejected attempt must not
+        // keep an overdue interval scheduled and cause an immediate retry loop.
+        assert!(!conn.try_publish(&config));
+        assert_eq!(next_deadline(&conn), None);
     }
 }

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use io_uring::opcode;
 use io_uring::types::{SubmitArgs, Timespec};
 use io_uring::IoUring;
-use std::collections::HashSet;
+use io_uring::{cqueue, opcode, squeue};
+use std::collections::{HashSet, VecDeque};
 use std::io;
 use std::time::Duration;
 
@@ -15,6 +15,80 @@ const CANCEL_USER_DATA_BIT: u64 = 1 << 63;
 // Keep cancellation-triggered async-poll task work bounded on older kernels.
 const SHUTDOWN_CANCEL_BATCH: usize = 32;
 const SHUTDOWN_WAIT: Duration = Duration::from_millis(100);
+
+/// Retains submissions when the SQ is full instead of losing an operation on
+/// an unchecked submit/push retry. Pending connection flags cover both queued
+/// and kernel-owned operations, keeping their buffers stable in either case.
+pub struct WorkerRing {
+    ring: IoUring,
+    deferred: VecDeque<squeue::Entry>,
+}
+
+impl WorkerRing {
+    pub fn new(entries: u32) -> io::Result<Self> {
+        Ok(Self {
+            ring: IoUring::new(entries)?,
+            deferred: VecDeque::new(),
+        })
+    }
+
+    /// # Safety
+    /// All pointers in the entry must remain valid until completion or until
+    /// `shutdown` has cancelled and drained the operation.
+    pub unsafe fn push(&mut self, entry: squeue::Entry) {
+        if !self.deferred.is_empty() || unsafe { self.ring.submission().push(&entry) }.is_err() {
+            self.deferred.push_back(entry);
+        }
+    }
+
+    pub fn wait(&mut self, timeout: Duration) -> io::Result<()> {
+        {
+            let mut sq = self.ring.submission();
+            while let Some(entry) = self.deferred.front() {
+                // SAFETY: push's caller retains the buffers through completion.
+                if unsafe { sq.push(entry) }.is_err() {
+                    break;
+                }
+                self.deferred.pop_front();
+            }
+        }
+        // Submit another batch promptly when locally queued work remains.
+        let wait_count = usize::from(!timeout.is_zero() && self.deferred.is_empty());
+        let ts = Timespec::new()
+            .sec(timeout.as_secs())
+            .nsec(timeout.subsec_nanos());
+        let args = SubmitArgs::new().timespec(&ts);
+        drain_after_submit(self.ring.submitter().submit_with_args(wait_count, &args))
+    }
+
+    pub fn completion(&mut self) -> cqueue::CompletionQueue<'_> {
+        self.ring.completion()
+    }
+
+    pub fn shutdown(&mut self, pending: Vec<u64>) -> io::Result<()> {
+        // These entries never reached the kernel. Cancelling their user_data
+        // yields ENOENT, which the common cancellation path already handles.
+        self.deferred.clear();
+        cancel_pending_operations(&mut self.ring, pending)
+    }
+}
+
+fn drain_after_submit(result: io::Result<usize>) -> io::Result<()> {
+    match result {
+        Ok(_) => Ok(()),
+        // Always allow the caller to reap CQEs, including on EBUSY. Retrying
+        // before draining can leave an overflowing completion queue stuck.
+        Err(ref error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EINTR | libc::EBUSY | libc::ETIME)
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
 
 pub fn encode_user_data(conn_key: usize, op: u64) -> u64 {
     (op << 48) | (conn_key as u64)
@@ -181,6 +255,54 @@ pub struct WorkerResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires Linux io_uring permission"]
+    fn queued_operations_survive_a_full_submission_queue() {
+        let mut ring = WorkerRing::new(8).unwrap();
+        for key in 0..100u64 {
+            // NOPs have no borrowed buffers.
+            unsafe {
+                ring.push(opcode::Nop::new().build().user_data(key));
+            }
+        }
+        assert!(!ring.deferred.is_empty());
+        let mut completed = HashSet::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while completed.len() < 100 && std::time::Instant::now() < deadline {
+            ring.wait(Duration::from_millis(10)).unwrap();
+            for cqe in ring.completion() {
+                assert_eq!(cqe.result(), 0);
+                assert!(completed.insert(cqe.user_data()));
+            }
+        }
+        assert_eq!(completed.len(), 100);
+        assert!(ring.deferred.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires Linux io_uring permission"]
+    fn overflow_and_busy_recovery_preserve_completions() {
+        let mut ring = WorkerRing::new(8).unwrap();
+        for batch in 0..3 {
+            for offset in 0..8 {
+                unsafe {
+                    ring.push(opcode::Nop::new().build().user_data(batch * 8 + offset));
+                }
+            }
+            ring.wait(Duration::ZERO).unwrap();
+        }
+        assert!(ring.ring.submission().cq_overflow());
+        // Current kernels may return success while CQEs are already visible.
+        // Inject EBUSY at the result boundary to verify that it permits draining.
+        drain_after_submit(Err(io::Error::from_raw_os_error(libc::EBUSY))).unwrap();
+        let mut completed: HashSet<_> = ring.completion().map(|cqe| cqe.user_data()).collect();
+        assert_eq!(completed.len(), 16);
+        ring.wait(Duration::ZERO).unwrap();
+        completed.extend(ring.completion().map(|cqe| cqe.user_data()));
+        assert_eq!(completed.len(), 24);
+        assert!(!ring.ring.submission().cq_overflow());
+    }
 
     #[test]
     fn pending_user_data_contains_only_active_operations() {
