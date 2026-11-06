@@ -78,9 +78,6 @@ name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
-dependencies = [
- "serde",
-]
 
 [[package]]
 name = "cc"
@@ -197,9 +194,9 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "flowsdk"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6f9d63cce58427374482382b2c290fff670418b0033a0ecf2a1eb613737674b"
+checksum = "2c23400d4f01e0881abfef99e700e0c12383ea6645039d366ef8d489a93b094d"
 dependencies = [
  "bytes",
  "hex",

@@ -11,7 +11,7 @@ default = []
 quic = ["flowsdk/quic-proto", "dep:rustls", "dep:rustls-native-certs", "dep:rustls-pki-types"]
 
 [dependencies]
-flowsdk = { version = "0.7.0", default-features = false, features = ["std", "strict-protocol-compliance"] }
+flowsdk = { version = "0.8.0", default-features = false, features = ["std", "strict-protocol-compliance", "shared-payloads"] }
 socket2 = "0.5"
 libc = "0.2"
 slab = "0.4"

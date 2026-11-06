@@ -40,8 +40,10 @@ QUIC avoids TCP's mandatory send/recv buffers. The main cost is the quinn-proto 
 ## Build
 
 Requires Rust 1.85+ and Linux (io_uring). This is a standalone Cargo crate
-with its own lockfile and depends on the published FlowSDK 0.7 release from
-crates.io.
+with its own lockfile and depends on the published FlowSDK 0.8.0 release from
+crates.io. Both TCP and QUIC builds enable `shared-payloads`, which uses shared
+payload storage and lets reduced parsing retain buffer views instead of copying
+each frame.
 
 Run the following commands from `~/repo/mqtt_ring_bench`.
 
@@ -257,7 +259,7 @@ to completion draining before another submission attempt.
 
 **TCP mode** (default): Each connection wraps a `NoIoMqttClient` for protocol handling and feeds bytes in/out via io_uring send/recv operations.
 
-**QUIC mode** (`--quic`): Each connection wraps a `QuicMqttEngine` (sans-I/O QUIC+MQTT engine) with its own UDP socket. The UDP socket is "connected" via `libc::connect()` so the same io_uring `Send`/`Recv` opcodes work for both TCP and UDP. QUIC retains a scheduled 10ms transport tick because FlowSDK 0.7 does not expose the next QUIC transport deadline. Traffic on one connection no longer ticks every other connection. TCP uses the MQTT engine's exact deadlines.
+**QUIC mode** (`--quic`): Each connection wraps a `QuicMqttEngine` (sans-I/O QUIC+MQTT engine) with its own UDP socket. The UDP socket is "connected" via `libc::connect()` so the same io_uring `Send`/`Recv` opcodes work for both TCP and UDP. QUIC retains a scheduled 10ms transport tick because FlowSDK 0.8 does not expose the next QUIC transport deadline. Traffic on one connection no longer ticks every other connection. TCP uses the MQTT engine's exact deadlines.
 
 ### Connection state machine
 

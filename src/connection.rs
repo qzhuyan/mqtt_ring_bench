@@ -506,7 +506,7 @@ pub struct QuicConnection {
     pub send_pending: bool,
     pub client_index: usize,
     pub drain_deadline: Option<Instant>,
-    /// FlowSDK 0.7 does not expose quinn's next transport timeout. Preserve
+    /// FlowSDK 0.8 does not expose quinn's next transport timeout. Preserve
     /// its 10 ms driving cadence without ticking on unrelated clients' I/O.
     pub next_transport_tick: Instant,
     pub server_addr: SocketAddr,
