@@ -69,6 +69,32 @@ Native builds write `target/release/mqtt_ring_bench`. Cross-builds write
 `target/<target>/release/mqtt_ring_bench`; the Linux musl targets produce a
 statically linked binary.
 
+### Release CI
+
+The `Release binaries` GitHub Actions workflow runs on pull requests, manual
+dispatch, and published GitHub releases. It builds four archives: TCP-only and
+TCP+QUIC binaries for both `x86_64-unknown-linux-musl` and
+`aarch64-unknown-linux-musl`, using native Ubuntu runners and Rust 1.95.0.
+
+Each build verifies that the ELF binary has no dynamic interpreter or shared
+library dependencies and runs `--help`. Archives include the
+executable, README, and license, with a separate SHA-256 checksum file. All runs
+upload Actions artifacts; release runs also attach them to the published GitHub
+release after every build succeeds.
+
+To build the same archive locally on a Linux machine matching the target
+architecture, install `musl-tools`, `binutils`, and Python 3, add the Rust target,
+then run:
+
+```bash
+rustup target add aarch64-unknown-linux-musl
+bash scripts/build-release.sh aarch64-unknown-linux-musl quic
+```
+
+Use `tcp` for a TCP-only binary or `x86_64-unknown-linux-musl` on an x86_64 host.
+Archives are written to `target/release-dist/` and named
+`mqtt_ring_bench-<version>-<target>-<tcp|quic>.tar.gz`.
+
 ## Test
 
 ```bash
